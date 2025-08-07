@@ -1,10 +1,13 @@
 const express = require('express');
 const CustomerDomain = require('../models/customerDomain'); 
+const User = require('../models/User'); 
+const acme = require('acme-client');
+const { DNSProvider } = require('../utils/DNSProvider');  
+const { Client } = acme;
 const authMiddleware = require('../middlewares/authMiddleware');
 const router = express.Router();
 
 // Route to create a new customer domain configuration
-const User = require('../models/User'); 
 
 router.post('/', async (req, res) => {
   try {
@@ -33,6 +36,67 @@ router.post('/', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+
+
+router.post('/request-certificate', async (req, res) => {
+  try {
+    const { subdomain, userId } = req.body;
+    
+    // Find customer domain from DB
+    const customerDomain = await CustomerDomain.findOne({ subdomain, user: userId });
+    if (!customerDomain) {
+      return res.status(404).json({ message: 'Customer domain not found' });
+    }
+
+    // Setup ACME client with Let's Encrypt Staging server (use production after testing)
+    const client = new Client({
+      directoryUrl: acme.directory.letsencrypt.staging, // Change to production later
+      accountKey: customerDomain.user.accountKey, // Assuming user's account key is stored in the user schema
+    });
+
+    // Create a new private key for Let's Encrypt certificate
+    const privateKey = await acme.forge.createPrivateKey();
+
+    // Fetch the authorization object for the domain
+    const authorizations = await client.getAuthorizations(customerDomain.subdomain);
+    const authorization = authorizations[0];
+    const dnsChallenge = authorization.challenges.find(challenge => challenge.type === 'dns-01');
+
+    if (!dnsChallenge) {
+      return res.status(400).json({ message: 'No DNS challenge available for this domain' });
+    }
+
+    // Extract the DNS challenge details
+    const { token, keyAuthorization } = dnsChallenge;
+    const { name, type, value } = dnsChallenge;
+
+    // Now, use the DNS provider's API (Route53/Cloudflare) to add the DNS record
+    await DNSProvider.addDNSRecord(customerDomain.subdomain, name, type, value);
+    
+    // Update domain status to dns_validation
+    customerDomain.status = 'dns_validation';
+    await customerDomain.save();
+
+    // Poll the challenge until it's validated
+    await client.answerChallenge(dnsChallenge);
+    await client.pollAuthorization(authorization);
+
+    // Once the DNS challenge is validated, request the certificate
+    const certificate = await client.getCertificate({ domain: customerDomain.subdomain });
+
+    // Save the certificate and key to the database
+    customerDomain.status = 'certificate_issued';
+    customerDomain.certificate = certificate.cert;
+    customerDomain.privateKey = privateKey;
+    await customerDomain.save();
+
+    res.status(200).json({ message: 'Certificate issued successfully', certificate });
+  } catch (error) {
+    console.error('Error issuing certificate:', error);
+    res.status(500).json({ message: 'Error during certificate issuance', error: error.message });
   }
 });
 

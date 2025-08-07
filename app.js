@@ -18,7 +18,6 @@ app.use("/api/customer-domain",customerDomainRoutes);
 
 
 // const https = require('https');
-// const { connectDB } = require('./utils/dbConnect');
 // const privateKey = fs.readFileSync(path.join(__dirname, 'certs', 'privkey.pem'), 'utf8');
 // const certificate = fs.readFileSync(path.join(__dirname, 'certs', 'cert.pem'), 'utf8');
 // const ca = fs.readFileSync(path.join(__dirname, 'certs', 'fullchain.pem'), 'utf8');
