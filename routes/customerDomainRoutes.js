@@ -54,7 +54,7 @@ router.post('/request-certificate', async (req, res) => {
     // Setup ACME client with Let's Encrypt Staging server (use production after testing)
     const client = new Client({
       directoryUrl: acme.directory.letsencrypt.staging, // Change to production later
-      accountKey: customerDomain.user.accountKey, // Assuming user's account key is stored in the user schema
+      accountKey: customerDomain.user.accountKey,
     });
 
     // Create a new private key for Let's Encrypt certificate
