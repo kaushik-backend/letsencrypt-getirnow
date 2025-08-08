@@ -1,25 +1,33 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const CryptoJS = require("crypto-js");
 const jwt = require('jsonwebtoken');
 const User = require('../models/User'); 
+const CustomerDomain = require("../models/customerDomain");
+const { requestCertificate, waitForCertificate, createDNSRecord, getCertificateStatus } = require('../utils/customer-setup');
 const router = express.Router();
+
+const dotenv = require("dotenv");
+dotenv.config();
 
 
 const { DNSProvider } = require('../utils/DNSProvider');  // DNS provider helper (e.g., GoDaddy, Route53, etc.)
 
 const createCustomerDomainAfterRegistration = async (user) => {
+   console.log("=============inside-createCustomerDomainAfterRegistration========");
   try {
-    const companySlug = user.companyname.replace(/\s+/g, '-').toLowerCase();
+     console.log("=============before subdomain========");
     const subdomain = `investor.${user.domain}`;  // Subdomain for the user
-    const stockSymbol = user.stock_ticker_symbol.toLowerCase();
-    const mappedTo = `${stockSymbol}.getirnow.com`;  // Mapping destination for the subdomain
-
-    // Check if subdomain already exists
-    const existingDomain = await CustomerDomain.findOne({ subdomain });
+     console.log("=============after subdomain========",subdomain);
+    // Check if the subdomain and domain combination already exists
+    const existingDomain = await CustomerDomain.findOne({ subdomain, companyName: user.companyname });
     if (existingDomain) {
-      console.log(`Subdomain ${subdomain} already exists.`);
+      console.log(`Subdomain ${subdomain} already exists for the company ${user.companyname}.`);
       return;
     }
+
+     const stockSymbol = user.stock_ticker_symbol.toLowerCase();
+    const mappedTo = `${stockSymbol}.debsom.shop`;  // Mapping destination for the subdomain
 
     // Create a new customer domain record with a 'pending' status
     const customerDomain = new CustomerDomain({
@@ -33,18 +41,18 @@ const createCustomerDomainAfterRegistration = async (user) => {
       status: 'pending'
     });
 
-    // Request SSL certificate from Let's Encrypt (this will be done later)
+    // Request SSL certificate from Let's Encrypt
     try {
-      const certificateArn = await requestCertificate(subdomain); // Later you’ll integrate Let's Encrypt API here
+      const certificateArn = await requestCertificate(subdomain); // updated to Let's Encrypt 
       customerDomain.certificateArn = certificateArn;
       customerDomain.status = 'dns_validation';  // Set status to DNS validation
 
       // Get DNS validation records from Let's Encrypt
-      const dnsValidationData = await getDNSValidation(certificateArn); // You'll implement this
+      const dnsValidationData = await createDNSRecord(certificateArn);  // DNS record creation logic
       console.log("DNS Validation Record:", dnsValidationData);
 
       const { name, type, value } = dnsValidationData;
-
+       console.log("=======dns-validation-data=======".dnsValidationData);
       // Set DNS validation data on the customer domain record
       if (dnsValidationData) {
         customerDomain.dnsValidation = {
@@ -53,7 +61,7 @@ const createCustomerDomainAfterRegistration = async (user) => {
           value
         };
       } else {
-        customerDomain.errorMessage = 'DNS validation records not yet available from AWS. Please try again later.';
+        customerDomain.errorMessage = 'DNS validation records not yet available. Please try again later.';
         console.log(`DNS validation records not yet available for ${subdomain}.`);
       }
 
@@ -63,7 +71,6 @@ const createCustomerDomainAfterRegistration = async (user) => {
 
       // If DNS validation data is ready, continue to certificate issuance
       if (dnsValidationData) {
-        // In production, you will set this up to create CloudFront distribution after certificate is issued
         const AUTO_CREATE_DISTRIBUTION = process.env.AUTO_CREATE_DISTRIBUTION === 'true';
         if (AUTO_CREATE_DISTRIBUTION) {
           console.log(`Attempting to check certificate status for ${subdomain}...`);
@@ -72,14 +79,19 @@ const createCustomerDomainAfterRegistration = async (user) => {
             console.log(`Certificate issued for ${subdomain}, creating CloudFront distribution...`);
             customerDomain.status = 'certificate_issued';
             await customerDomain.save();
-            // Create CloudFront distribution
-            const cloudfrontDomain = await createCloudFrontDistribution(subdomain, certificateArn, mappedTo);
-            if (cloudfrontDomain) {
-              customerDomain.cloudfrontDomain = cloudfrontDomain;
-              customerDomain.status = 'cloudfront_created';
-              await customerDomain.save();
-              console.log(`CloudFront domain name saved for ${subdomain}: ${cloudfrontDomain}`);
-            }
+
+            // Create CloudFront distribution (optional if you're using AWS)
+            // const cloudfrontDomain = await createCloudFrontDistribution(subdomain, certificateArn, mappedTo);
+            // if (cloudfrontDomain) {
+            //   customerDomain.cloudfrontDomain = cloudfrontDomain;
+            //   customerDomain.status = 'cloudfront_created';
+            //   await customerDomain.save();
+            //   console.log(`CloudFront domain name saved for ${subdomain}: ${cloudfrontDomain}`);
+            // } else {
+            //   console.error(`Failed to create CloudFront distribution for ${subdomain}.`);
+            // }
+          } else {
+            console.log(`Certificate for ${subdomain} not issued yet.`);
           }
         }
       }
@@ -95,24 +107,8 @@ const createCustomerDomainAfterRegistration = async (user) => {
 };
 
 // updated sign-up route
-exports.signup = async (req, res) => {
-  try {
-    const { data } = req.body;
-    const decryptedBytes = CryptoJS.AES.decrypt(
-      data,
-      process.env.DECRYPT_SECRET_KEY
-    );
-    const decryptedText = decryptedBytes.toString(CryptoJS.enc.Utf8);
-
-    if (!decryptedText) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid or tampered encrypted data.",
-      });
-    }
-
-    const decryptedPayload = JSON.parse(decryptedText);
-
+router.post('/sign-up',async (req, res) => {
+    console.log("====data=====",req.body)
     const {
       firstname,
       lastname,
@@ -122,17 +118,24 @@ exports.signup = async (req, res) => {
       phone,
       stock_ticker_symbol,
       password,
-    } = decryptedPayload;
+    } = req.body;
 
-    if (
-      !(
-        firstname &&
-        companyname &&
-        domain &&
-        email &&
-        stock_ticker_symbol
-      )
-    ) {
+  try {
+    // // Decrypt the incoming encrypted data
+    // const decryptedBytes = CryptoJS.AES.decrypt(data, process.env.DECRYPT_SECRET_KEY);
+    // const decryptedText = decryptedBytes.toString(CryptoJS.enc.Utf8);
+
+    // if (!decryptedText) {
+    //   return res.status(400).json({
+    //     success: false,
+    //     message: "Invalid or tampered encrypted data.",
+    //   });
+    // }
+
+    // const decryptedPayload = JSON.parse(decryptedText);
+
+    // Validate required fields
+    if (!(firstname && companyname && domain && email && stock_ticker_symbol)) {
       return res.status(400).json({
         success: false,
         message: "All mandatory fields are required",
@@ -147,7 +150,7 @@ exports.signup = async (req, res) => {
       });
     }
 
-    // Check if the domain is valid
+    // Validate domain format
     const domainRegex = /^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$/;
     if (!domainRegex.test(domain)) {
       return res.status(400).json({
@@ -157,9 +160,9 @@ exports.signup = async (req, res) => {
     }
 
     // Check if email, company name, and domain already exist
-    const emailExists = await userModel.findOne({ email });
-    const companyExists = await userModel.findOne({ companyname });
-    const domainExist = await userModel.findOne({ domain });
+    const emailExists = await User.findOne({ email });
+    const companyExists = await User.findOne({ companyname });
+    const domainExist = await User.findOne({ domain });
 
     if (emailExists) {
       return res.status(409).json({
@@ -180,11 +183,11 @@ exports.signup = async (req, res) => {
       });
     }
 
-    // Hash the password
+    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Create the new user with domain
-    const newUser = new userModel({
+    // Create a new user
+    const newUser = new User({
       firstname: firstname?.trim(),
       lastname: lastname?.trim() || "",
       companyname: companyname?.trim().toLowerCase(),
@@ -197,21 +200,25 @@ exports.signup = async (req, res) => {
 
     await newUser.save();
 
-    // Call function to create customer domain after registration
+    // After registration, create the customer domain
     setTimeout(async () => {
-      await createCustomerDomainAfterRegistration(newUser);
+      try {
+        await createCustomerDomainAfterRegistration(newUser);
+      } catch (err) {
+        console.error('Error during customer domain creation:', err);
+      }
     }, 0);
 
-    // Generate tokens and send response
-    const accessToken = generateAccessToken(newUser);
-    await logActivity(newUser._id, `Investor ${newUser.companyname} Successfully Registered`);
-
-    // Send registration email
-    await registration(newUser.email);
+    // Generate JWT token for the user
+    const payload = {
+      id: newUser._id,
+      email: newUser.email,
+    };
+    const accessToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "24h" });
 
     return res.status(200).json({
       success: true,
-      message: "Welcome to the platform 🎉",
+      message: "Welcome to the IR platform ",
       user: {
         firstname: newUser.firstname,
         lastname: newUser.lastname,
@@ -230,35 +237,10 @@ exports.signup = async (req, res) => {
       message: "Internal Server Error. Please try again later.",
     });
   }
-};
-
-// Route for user registration
-router.post('/register', async (req, res) => {
-    const { name, email, password } = req.body;
-  try {  
-    // Check if the user already exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: 'User already exists' });
-    }
-    
-    // Create a new user
-    const newUser = new User({ name, email, password });
-    
-    // Hash password before saving
-    newUser.password = await bcrypt.hash(password, 10);
-    
-    // Save the user to the database
-    await newUser.save();
-    
-    res.status(201).json({ message: 'User registered successfully', user: newUser });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server error' });
-  }
 });
 
-// Route for user login
+
+// Route for user login -- for demo app set-up
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
