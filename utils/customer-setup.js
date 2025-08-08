@@ -1,10 +1,10 @@
 const acmeClient = require('acme-client');
-const axios = require('axios');
+const AWS = require('aws-sdk');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-// create the Let's Encrypt account key
+// Create the Let's Encrypt account key
 const createAccountKey = async () => {
   const accountKeyPath = path.join(__dirname, '..', process.env.LETS_ENCRYPT_ACCOUNT_KEY);
   console.log('Account Key Path:', accountKeyPath);
@@ -19,47 +19,41 @@ const createAccountKey = async () => {
     accountKey = acmeClient.forge.createPrivateKey();
     fs.writeFileSync(accountKeyPath, accountKey);
   }
-
   return accountKey;
 };
 
 // Function to create an ACME client
 const createAcmeClient = async () => {
   const accountKey = await createAccountKey();
-
   return new acmeClient.Client({
     directoryUrl: acmeClient.directory.letsencrypt.production,
-    accountKey
+    accountKey,
   });
 };
 
-// Function to request a certificate from Let's Encrypt
+// Request SSL certificate from Let's Encrypt
 const requestCertificate = async (subdomain) => {
   try {
     const client = await createAcmeClient();
 
-    // Creating account with Let's Encrypt
+    // create account with Let's Encrypt
     const account = await client.createAccount({
-      contact: [`mailto:${process.env.LETS_ENCRYPT_EMAIL}`],
-      termsOfServiceAgreed: true
+         contact: [`mailto:${process.env.LETS_ENCRYPT_EMAIL}`],
+         termsOfServiceAgreed: true
     });
-
-    // Log the account to see what is returned
-    console.log('Account created:', account);
 
     // Create the order for the domain certificate
     const order = await client.createOrder({
       identifiers: [
-        { type: 'dns', value: `${subdomain}.${process.env.DOMAIN}` }  // error zone found   working with debsom.com but not with debsom.shop
-      ]
+        { type: 'dns', value: `${subdomain}.${process.env.DOMAIN}` },
+      ],
     });
 
     // Perform DNS-01 challenge
     const authorization = await client.getAuthorizations(order);
-    const challenge = authorization[0].challenges.find(chal => chal.type === 'dns-01');
-    console.log("=============challenge==========", challenge);
-    // const challenge = authorization.find(chal => chal.type === 'dns-01');
-
+    console.log("Authorization",authorization);
+    const challenge = authorization[0].challenges.find((chal) => chal.type === 'dns-01');
+    console.log("Challenge found:", challenge);
     if (!challenge) {
       throw new Error('No DNS challenge found');
     }
@@ -67,53 +61,79 @@ const requestCertificate = async (subdomain) => {
     await createDNSRecord(challenge);
 
     // Poll for DNS validation success
-    const result = await client.pollAuthorization(authorization);
-    if (result.status === 'valid') {
-      // Finalize the certificate order
-      const certificate = await client.finalizeOrder(order, challenge);
-      return certificate;
+    let result;
+    let attempts = 0;
+    while (attempts <2) {  // Poll for a max of 30 attempts
+      attempts++;
+      console.log(`Polling attempt ${attempts}...`);
+      // Get the authorization status
+      result = await client.getAuthorizations(challenge.url);
+      if (result.status === 'valid') {
+        console.log('DNS validation successful');
+        break;
+      }
+
+      console.log('DNS validation in progress...');
+      // Wait for 10 seconds before retrying
+      await new Promise((resolve) => setTimeout(resolve, 10000));
     }
 
-    throw new Error('DNS validation failed');
+    if (result.status !== 'valid') {
+      throw new Error('DNS validation failed');
+    }
+
+    // Finalize the certificate order
+    const certificate = await client.finalizeOrder(order, challenge);
+    return certificate;
   } catch (error) {
     console.error('Error in certificate request:', error);
     throw error;
   }
 };
 
-// Function to create DNS TXT record in GoDaddy for validation
+// Create DNS TXT record for validation
 const createDNSRecord = async (challenge) => {
-  const { token } = challenge; // Use the challenge token directly
+  const { token, value } = challenge;
 
   try {
-    // The DNS record name is usually _acme-challenge.<token>
     const dnsData = {
       type: 'TXT',
       name: `_acme-challenge.${token}`,
-      data: challenge.value, // This is the value you need to place in the TXT record
-      ttl: 600
+      value: `"${value}"`,
+      ttl: 600,
     };
 
-    // GoDaddy API call to create the TXT record
-    await axios.post(`https://api.godaddy.com/v1/domains/${process.env.DOMAIN}/records/TXT`, [dnsData], {
-      headers: {
-        Authorization: `sso-key ${process.env.GODADDY_API_KEY}:${process.env.GODADDY_API_SECRET}`,
-        'Content-Type': 'application/json'
-      }
-    });
+    console.log("====dns-data========",dnsData);
 
-    console.log(`DNS record created for challenge: ${token}`);
+    // Using AWS Route 53 as an example
+   if (process.env.DNS_PROVIDER === 'Route53') {
+      // AWS Route 53 DNS record creation
+      const route53 = new AWS.Route53();
+      const params = {
+        HostedZoneId: process.env.ROUTE53_HOSTED_ZONE_ID,
+        ChangeBatch: {
+          Changes: [
+            {
+              Action: 'UPSERT',
+              ResourceRecordSet: dnsData,
+            },
+          ],
+        },
+      };
+      await route53.changeResourceRecordSets(params).promise();
+      console.log(`Route53 DNS record created for challenge: ${token}`);
+    }
   } catch (error) {
     console.error('Error in creating DNS record:', error);
     throw error;
   }
 };
 
-// Function to check certificate status (simulating the polling)
+// Poll for certificate status
 const waitForCertificate = async (certificateArn, timeout = 60000) => {
   const startTime = Date.now();
   while (Date.now() - startTime < timeout) {
-    const certificateStatus = await getCertificateStatus(certificateArn); 
+    const certificateStatus = await getCertificateStatus(certificateArn);
     if (certificateStatus === 'ISSUED') {
       return true;
     }
@@ -122,15 +142,72 @@ const waitForCertificate = async (certificateArn, timeout = 60000) => {
   return false;
 };
 
-// Function to simulate certificate status retrieval (you can customize this if using actual AWS)
+// Simulate certificate status retrieval (for now)
 const getCertificateStatus = async (certificateArn) => {
-  return 'ISSUED'; // Simulating certificate issuance status for now until aws-sdk used
+  return 'ISSUED'; // Replace with actual status retrieval
 };
 
-// Export all the utility functions
+// Create CloudFront Distribution
+const createCloudFrontDistribution = async (subdomain, certificateArn, mappedTo) => {
+  const cloudfront = new AWS.CloudFront();
+
+  const params = {
+    DistributionConfig: {
+      CallerReference: `getirnow-${subdomain}-${Date.now()}`,
+      Aliases: {
+        Quantity: 1,
+        Items: [`${subdomain}.${process.env.DOMAIN}`],
+      },
+      DefaultCacheBehavior: {
+        TargetOriginId: 'S3-getirnow',
+        ViewerProtocolPolicy: 'redirect-to-https',
+        AllowedMethods: {
+          Quantity: 2,
+          Items: ['GET', 'HEAD'],
+          CachedMethods: {
+            Quantity: 2,
+            Items: ['GET', 'HEAD'],
+          },
+        },
+      },
+      Origins: {
+        Quantity: 1,
+        Items: [
+          {
+            Id: 'S3-getirnow',
+            DomainName: mappedTo, // Your internal route or AWS resource
+            CustomOriginConfig: {
+              HTTPPort: 80,
+              HTTPSPort: 443,
+              OriginProtocolPolicy: 'https-only',
+            },
+          },
+        ],
+      },
+      DefaultRootObject: 'index.html',
+      Enabled: true,
+      ViewerCertificate: {
+        ACMCertificateArn: certificateArn,
+        SslSupportMethod: 'sni-only',
+      },
+    },
+  };
+
+  try {
+    const distribution = await cloudfront.createDistribution(params).promise();
+    console.log('CloudFront Distribution created:', distribution);
+    return distribution.DomainName;
+  } catch (error) {
+    console.error('Error in creating CloudFront distribution:', error);
+    throw error;
+  }
+};
+
+// Export utility functions
 module.exports = {
   requestCertificate,
   createDNSRecord,
   waitForCertificate,
-  getCertificateStatus
+  getCertificateStatus,
+  createCloudFrontDistribution,
 };

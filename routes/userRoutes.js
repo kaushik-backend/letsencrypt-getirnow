@@ -1,10 +1,11 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const CryptoJS = require("crypto-js");
 const jwt = require('jsonwebtoken');
 const User = require('../models/User'); 
 const CustomerDomain = require("../models/customerDomain");
-const { requestCertificate, waitForCertificate, createDNSRecord, getCertificateStatus } = require('../utils/customer-setup');
+// const { requestCertificate, waitForCertificate, createDNSRecord, getCertificateStatus } = require('../utils/customer-setup');
+const AWS = require('aws-sdk');
+const { requestCertificate, createDNSRecord, waitForCertificate, createCloudFrontDistribution } = require('../utils/customer-setup'); 
 const router = express.Router();
 
 const dotenv = require("dotenv");
@@ -13,21 +14,26 @@ dotenv.config();
 
 const { DNSProvider } = require('../utils/DNSProvider');  // DNS provider helper (e.g., GoDaddy, Route53, etc.)
 
+// AWS Route 53 client
+const route53 = new AWS.Route53();
+
+// Function to create a customer domain after registration
 const createCustomerDomainAfterRegistration = async (user) => {
-   console.log("=============inside-createCustomerDomainAfterRegistration========");
+  console.log("============= Inside createCustomerDomainAfterRegistration ============");
+
   try {
-     console.log("=============before subdomain========");
     const subdomain = `investor.${user.domain}`;  // Subdomain for the user
-     console.log("=============after subdomain========",subdomain);
-    // Check if the subdomain and domain combination already exists
+    const stockSymbol = user.stock_ticker_symbol.toLowerCase();
+    const mappedTo = `${stockSymbol}.debsom.shop`;  // Mapping destination for the subdomain
+
+    console.log("Subdomain:", subdomain);
+
+    // Check if the subdomain already exists in the customer domain records
     const existingDomain = await CustomerDomain.findOne({ subdomain, companyName: user.companyname });
     if (existingDomain) {
       console.log(`Subdomain ${subdomain} already exists for the company ${user.companyname}.`);
       return;
     }
-
-     const stockSymbol = user.stock_ticker_symbol.toLowerCase();
-    const mappedTo = `${stockSymbol}.debsom.shop`;  // Mapping destination for the subdomain
 
     // Create a new customer domain record with a 'pending' status
     const customerDomain = new CustomerDomain({
@@ -36,79 +42,83 @@ const createCustomerDomainAfterRegistration = async (user) => {
       companyWebsite: `https://${user.domain}`,
       subdomain,
       mappedTo,
-      customerDNSProvider: 'GoDaddy', // Specify DNS provider
+      customerDNSProvider: 'Route 53', // Using AWS Route 53 for DNS management
       user: user._id,
-      status: 'pending'
+      status: 'pending',
     });
 
     // Request SSL certificate from Let's Encrypt
-    try {
-      const certificateArn = await requestCertificate(subdomain); // updated to Let's Encrypt 
-      customerDomain.certificateArn = certificateArn;
-      customerDomain.status = 'dns_validation';  // Set status to DNS validation
+    const certificate = await requestCertificate(subdomain);
+    const certificateArn = certificate.certificate;
 
-      // Get DNS validation records from Let's Encrypt
-      const dnsValidationData = await createDNSRecord(certificateArn);  // DNS record creation logic
-      console.log("DNS Validation Record:", dnsValidationData);
+    // Update customer domain record with the certificate ARN and validation status
+    customerDomain.certificateArn = certificateArn;
+    customerDomain.status = 'dns_validation';
 
-      const { name, type, value } = dnsValidationData;
-       console.log("=======dns-validation-data=======".dnsValidationData);
-      // Set DNS validation data on the customer domain record
-      if (dnsValidationData) {
-        customerDomain.dnsValidation = {
-          name,
-          type,
-          value
-        };
-      } else {
-        customerDomain.errorMessage = 'DNS validation records not yet available. Please try again later.';
-        console.log(`DNS validation records not yet available for ${subdomain}.`);
-      }
+    // Save the customer domain before DNS validation
+    await customerDomain.save();
 
-      // Save customer domain
+    console.log(`Customer domain created successfully for ${user.companyname} with subdomain ${subdomain}.`);
+
+    // Poll for DNS validation success
+    const isValidated = await waitForCertificate(certificateArn, 1); // Check if the certificate is validated
+    if (isValidated) {
+      console.log(`Certificate for ${subdomain} validated successfully.`);
+
+      // Create CloudFront distribution after the certificate is issued
+      const cloudfrontDomain = await createCloudFrontDistribution(subdomain, certificateArn, mappedTo);
+      customerDomain.cloudfrontDomain = cloudfrontDomain;
+      customerDomain.status = 'cloudfront_created';
+
+      // Save updated customer domain with CloudFront information
       await customerDomain.save();
-      console.log(`Customer domain created successfully for ${user.companyname} mapped to ${mappedTo}`);
-
-      // If DNS validation data is ready, continue to certificate issuance
-      if (dnsValidationData) {
-        const AUTO_CREATE_DISTRIBUTION = process.env.AUTO_CREATE_DISTRIBUTION === 'true';
-        if (AUTO_CREATE_DISTRIBUTION) {
-          console.log(`Attempting to check certificate status for ${subdomain}...`);
-          const isIssued = await waitForCertificate(certificateArn, 1); // Poll for certificate issuance
-          if (isIssued) {
-            console.log(`Certificate issued for ${subdomain}, creating CloudFront distribution...`);
-            customerDomain.status = 'certificate_issued';
-            await customerDomain.save();
-
-            // Create CloudFront distribution (optional if you're using AWS)
-            // const cloudfrontDomain = await createCloudFrontDistribution(subdomain, certificateArn, mappedTo);
-            // if (cloudfrontDomain) {
-            //   customerDomain.cloudfrontDomain = cloudfrontDomain;
-            //   customerDomain.status = 'cloudfront_created';
-            //   await customerDomain.save();
-            //   console.log(`CloudFront domain name saved for ${subdomain}: ${cloudfrontDomain}`);
-            // } else {
-            //   console.error(`Failed to create CloudFront distribution for ${subdomain}.`);
-            // }
-          } else {
-            console.log(`Certificate for ${subdomain} not issued yet.`);
-          }
-        }
-      }
-    } catch (error) {
+      console.log(`CloudFront distribution created for ${subdomain}.`);
+    } else {
+      console.log(`Certificate validation failed for ${subdomain}.`);
       customerDomain.status = 'error';
-      customerDomain.errorMessage = `Certificate request failed: ${error.message}`;
+      customerDomain.errorMessage = 'Certificate validation failed';
       await customerDomain.save();
-      console.error('Error in certificate request during customer domain creation:', error);
     }
   } catch (error) {
-    console.error('Error creating customer domain after registration:', error);
+    console.error('Error in creating customer domain:', error);
+    // const customerDomain = new CustomerDomain({
+    //   companyName: user.companyname,
+    //   stockSymbol: user.stock_ticker_symbol,
+    //   subdomain: `investor.${user.domain}`,
+    //   status: 'error',
+    //   errorMessage: `Error during domain creation: ${error.message}`,
+    // });
+    // await customerDomain.save();
   }
 };
 
+// Function to check and renew the certificate if it is close to expiration
+const scheduleCertificateRenewal = async () => {
+  try {
+    const certificateArn = process.env.LETS_ENCRYPT_CERTIFICATE_ARN;  // Get the certificate ARN (from DB or environment)
+    const expiryDate = await getCertificateExpiryDate(certificateArn); // You will need to implement this method using Let's Encrypt API
+
+    const daysToExpire = (expiryDate - Date.now()) / (1000 * 60 * 60 * 24); // Calculate days until expiration
+    if (daysToExpire <= 30) {
+      console.log('Certificate is expiring soon, initiating renewal...');
+      const renewedCertificate = await requestCertificate(`investor.${process.env.DOMAIN}`);
+      console.log('Certificate renewed successfully:', renewedCertificate);
+      // Update the certificate ARN in your DB
+      await updateCertificateArnInDatabase(renewedCertificate.certificateArn);
+    } else {
+      console.log('Certificate is valid for another ' + daysToExpire + ' days.');
+    }
+  } catch (error) {
+    console.error('Error in certificate renewal check:', error);
+  }
+};
+
+//  cron should be used in production
+// E.g., schedule it to run once a day
+setInterval(scheduleCertificateRenewal, 24 * 60 * 60 * 1000);  // Run once a day
+
 // updated sign-up route
 router.post('/sign-up',async (req, res) => {
-    console.log("====data=====",req.body)
     const {
       firstname,
       lastname,
@@ -121,19 +131,6 @@ router.post('/sign-up',async (req, res) => {
     } = req.body;
 
   try {
-    // // Decrypt the incoming encrypted data
-    // const decryptedBytes = CryptoJS.AES.decrypt(data, process.env.DECRYPT_SECRET_KEY);
-    // const decryptedText = decryptedBytes.toString(CryptoJS.enc.Utf8);
-
-    // if (!decryptedText) {
-    //   return res.status(400).json({
-    //     success: false,
-    //     message: "Invalid or tampered encrypted data.",
-    //   });
-    // }
-
-    // const decryptedPayload = JSON.parse(decryptedText);
-
     // Validate required fields
     if (!(firstname && companyname && domain && email && stock_ticker_symbol)) {
       return res.status(400).json({
